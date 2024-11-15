@@ -2,8 +2,6 @@
 //
 // Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
 //
-// Copyright (c) 2020 Uber Technologies, Inc.
-//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
@@ -22,78 +20,104 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination authorizer_mock.go
-
-package authorization
+package authorizer
 
 import (
 	"context"
-	"fmt"
-	"strings"
-
-	"go.temporal.io/server/common/config"
+    "log"
+    "strings"
+	"go.temporal.io/server/common/authorization"
 )
 
-const (
-	// DecisionDeny means auth decision is deny
-	DecisionDeny Decision = iota + 1
-	// DecisionAllow means auth decision is allow
-	DecisionAllow
-)
+type myAuthorizer struct{}
 
-// @@@SNIPSTART temporal-common-authorization-authorizer-calltarget
-// CallTarget is contains information for Authorizer to make a decision.
-// It can be extended to include resources like WorkflowType and TaskQueue
-type CallTarget struct {
-	// APIName must be the full API function name.
-	// Example: "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution".
-	APIName string
-	// If a Namespace is not being targeted this be set to an empty string.
-	Namespace string
-	// The nexus endpoint name being targeted (if any).
-	NexusEndpointName string
-	// Request contains a deserialized copy of the API request object
-	Request interface{}
+func NewMyAuthorizer() authorization.Authorizer {
+	return &myAuthorizer{}
 }
 
-// @@@SNIPEND
+var decisionAllow = authorization.Result{Decision: authorization.DecisionAllow}
+var decisionDeny = authorization.Result{Decision: authorization.DecisionDeny}
 
-type (
-	// Result is result from authority.
-	Result struct {
-		Decision Decision
-		// Reason may contain a message explaining the value of the Decision field.
-		Reason string
-	}
-
-	// Decision is enum type for auth decision
-	Decision int
-)
-
-// @@@SNIPSTART temporal-common-authorization-authorizer-interface
-// Authorizer is an interface for implementing authorization logic
-type Authorizer interface {
-	Authorize(ctx context.Context, caller *Claims, target *CallTarget) (Result, error)
+var readOnlyNamespaceAPI = map[string]struct{}{
+	"DescribeNamespace":              {},
+	"GetWorkflowExecutionHistory":    {},
+	"ListOpenWorkflowExecutions":     {},
+	"ListClosedWorkflowExecutions":   {},
+	"ListWorkflowExecutions":         {},
+	"ListArchivedWorkflowExecutions": {},
+	"ScanWorkflowExecutions":         {},
+	"CountWorkflowExecutions":        {},
+	"QueryWorkflow":                  {},
+	"DescribeWorkflowExecution":      {},
+	"DescribeTaskQueue":              {},
+	"ListTaskQueuePartitions":        {},
 }
 
-// @@@SNIPEND
-
-type hasNamespace interface {
-	GetNamespace() string
+var readOnlyGlobalAPI = map[string]struct{}{
+	"ListNamespaces":      {},
+	"GetSearchAttributes": {},
+	"GetClusterInfo":      {},
 }
 
-func GetAuthorizerFromConfig(config *config.Authorization) (Authorizer, error) {
-
-	switch strings.ToLower(config.Authorizer) {
-	case "":
-		return NewNoopAuthorizer(), nil
-	case "default":
-		return NewDefaultAuthorizer(), nil
-	}
-	return nil, fmt.Errorf("unknown authorizer: %s", config.Authorizer)
+func IsReadOnlyNamespaceAPI(api string) bool {
+	_, found := readOnlyNamespaceAPI[api]
+	return found
 }
 
-func IsNoopAuthorizer(authorizer Authorizer) bool {
-	_, ok := authorizer.(*noopAuthorizer)
-	return ok
+func IsReadOnlyGlobalAPI(api string) bool {
+	_, found := readOnlyGlobalAPI[api]
+	return found
+}
+
+func (a *myAuthorizer) Authorize(_ context.Context, claims *authorization.Claims,
+	target *authorization.CallTarget) (authorization.Result, error) {
+     log.Println("target.APIName::::", target.APIName)
+     log.Println("claims:: ", claims)
+     apiFullName := target.APIName
+     targetAPIName := apiFullName[strings.LastIndex(apiFullName, "/")+1:]
+     log.Println("targetAPIName:: " , targetAPIName)
+     isReadOnlyAPI := IsReadOnlyNamespaceAPI(targetAPIName)
+     isGlobalReadOnlyAPI := IsReadOnlyGlobalAPI(targetAPIName)
+     log.Println("isReadOnlyAPI: ", isReadOnlyAPI)
+     log.Println("isGlobalReadOnlyAPI: ", isGlobalReadOnlyAPI)
+     //We can restrict even for default - this is for a playground for internal teams - Make it param based.
+     //TODO: Make the restriction in prod.
+     if target.Namespace == "temporal-system" {
+            log.Println("Skipping authz - temporal-system namespace")
+     		return decisionAllow, nil
+     }
+
+
+     if claims == nil {
+            log.Println("Skipping authz - claims nil")
+     		return decisionAllow, nil
+     }
+
+
+     if ( isReadOnlyAPI || isGlobalReadOnlyAPI ) {
+            log.Println("Skipping authz - read API ")
+     		return decisionAllow, nil
+     }else {
+          log.Println("Authz - checking.. ")
+          log.Println(claims.System)
+          if claims.System & (authorization.RoleAdmin ) != 0 {
+          		return decisionAllow, nil
+          }
+          if claims.Namespaces[target.Namespace] & authorization.RoleWriter != 0 {
+                     log.Println("Authz allowed - namespace : " , target.Namespace)
+          			return decisionAllow, nil
+          } else {
+                    log.Println("Authz denied - namespace :" , target.Namespace)
+          			return decisionDeny, nil
+          }
+     }
+
+	// Allow all operations within "temporal-system" namespace
+	// DON'T DO THIS IN A PRODUCTION ENVIRONMENT
+	// IN PRODUCTION, only allow calls from properly authenticated and authorized callers
+	// We are taking a shortcut in the sample because we don't have TLS or a auth token
+
+
+	// Allow all other requests
+	return decisionAllow, nil
 }
