@@ -2,8 +2,6 @@
 //
 // Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
 //
-// Copyright (c) 2020 Uber Technologies, Inc.
-//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
@@ -22,73 +20,78 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination claim_mapper_mock.go
-
-package authorization
+package authorizer
 
 import (
-	"crypto/x509/pkix"
-	"fmt"
-	"strings"
-
+    "log"
+    "fmt"
+	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/config"
-	"go.temporal.io/server/common/log"
-	"google.golang.org/grpc/credentials"
+    "bytes"
+    "strings"
+    "encoding/json"
+    "net/http"
+    "io/ioutil"
 )
 
-// @@@SNIPSTART temporal-common-authorization-authinfo
-// Authentication information from subject's JWT token or/and mTLS certificate
-type AuthInfo struct {
-	AuthToken     string
-	TLSSubject    *pkix.Name
-	TLSConnection *credentials.TLSInfo
-	ExtraData     string
-	Audience      string
+type myClaimMapper struct{}
+
+func NewMyClaimMapper(_ *config.Config) authorization.ClaimMapper {
+	return &myClaimMapper{}
 }
 
-// @@@SNIPEND
+func checkNamespaceAuthz(token string, namespace string) string {
+ 	url := "http://temporalauthproxy:3030/auth-proxy"
+ 	postBody, _ := json.Marshal(map[string]string{
+                  "token":  token,
+                  "namespace": "default",
+               })
+    fmt.Println(string(postBody))
+        	// We can set the content type here
+        	resp, err := http.Post(url, "application/json", bytes.NewReader(postBody))
 
-// @@@SNIPSTART temporal-common-authorization-claimmapper-interface
-// ClaimMapper converts authorization info of a subject into Temporal claims (permissions) for authorization
-type ClaimMapper interface {
-	GetClaims(authInfo *AuthInfo) (*Claims, error)
-}
+        	body, err := ioutil.ReadAll(resp.Body)
+               if err != nil {
+                  log.Fatalln(err)
+               }
+               sb := string(body)
+               fmt.Println("Status:", sb)
+ 	return sb
+ }
 
-// @@@SNIPEND
+func (c myClaimMapper) GetClaims(authInfo *authorization.AuthInfo) (*authorization.Claims, error) {
+	claims := authorization.Claims{}
 
-// Normally, GetClaims will never be called without either an auth token or TLS metadata set in
-// AuthInfo. However, if you want your ClaimMapper to be called in all cases, you can implement
-// this additional interface and return false.
-type ClaimMapperWithAuthInfoRequired interface {
-	AuthInfoRequired() bool
-}
-
-// No-op claim mapper that gives system level admin permission to everybody
-type noopClaimMapper struct{}
-
-var _ ClaimMapper = (*noopClaimMapper)(nil)
-var _ ClaimMapperWithAuthInfoRequired = (*noopClaimMapper)(nil)
-
-func NewNoopClaimMapper() ClaimMapper {
-	return &noopClaimMapper{}
-}
-
-func (*noopClaimMapper) GetClaims(_ *AuthInfo) (*Claims, error) {
-	return &Claims{System: RoleAdmin}, nil
-}
-
-// This implementation can run even without auth info.
-func (*noopClaimMapper) AuthInfoRequired() bool {
-	return false
-}
-
-func GetClaimMapperFromConfig(config *config.Authorization, logger log.Logger) (ClaimMapper, error) {
-
-	switch strings.ToLower(config.ClaimMapper) {
-	case "":
-		return NewNoopClaimMapper(), nil
-	case "default":
-		return NewDefaultJWTClaimMapper(NewDefaultTokenKeyProvider(config, logger), config, logger), nil
+	if authInfo.TLSConnection != nil {
+		// Add claims based on client's TLS certificate
+		claims.Subject = authInfo.TLSSubject.CommonName
 	}
-	return nil, fmt.Errorf("unknown claim mapper: %s", config.ClaimMapper)
+	if authInfo.AuthToken != "" {
+		// Extract claims from the auth token and translate them into Temporal roles for the caller
+		// Here we'll simply hardcode some as an example
+		log.Println("Token")
+		log.Println(authInfo.AuthToken)
+        log.Println("auth-Info")
+        log.Println(authInfo)
+		parts := strings.Split(authInfo.AuthToken, " ")
+        if len(parts) != 2 {
+        		return nil, fmt.Errorf("unexpected authorization token format")
+        }
+        authzCheck := checkNamespaceAuthz(parts[1], "default")
+        if (authzCheck != "") {
+            claims.System = authorization.RoleWriter// cluster-level admin
+            claims.Namespaces = make(map[string]authorization.Role)
+            namespaces := strings.Split(authzCheck, ",")
+            for i := 0; i < len(namespaces); i++ {
+                  claims.Namespaces[namespaces[i]] = authorization.RoleWriter
+            }
+
+        }else{
+          claims.System = authorization.RoleReader// cluster-level admin
+        }
+
+
+	}
+
+	return &claims, nil
 }
